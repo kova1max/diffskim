@@ -1,0 +1,488 @@
+// Package skim folds away the parts of a patch a reviewer does not need to
+// read, and keeps the rest a patch that git apply accepts.
+package skim
+
+import (
+	"bytes"
+	"fmt"
+	"slices"
+	"strings"
+
+	"github.com/kova1max/diffskim/internal/patch"
+)
+
+// Source gives the rules access to the repository a patch came from. Both
+// methods may always answer "unknown"; the rules that need them then skip.
+type Source interface {
+	// Content returns the old or new content of a changed file.
+	Content(f *patch.File, newSide bool) ([]byte, bool)
+	// LinguistGenerated reports whether .gitattributes marks the path
+	// linguist-generated.
+	LinguistGenerated(path string) bool
+}
+
+// Fold is one folded piece of the patch: a whole file or a run of changed
+// lines in one hunk.
+type Fold struct {
+	Path   string `json:"path"`
+	Line   int    `json:"line,omitempty"` // first new-side line; 0 for a whole file
+	Rule   Rule   `json:"rule"`
+	Lines  int    `json:"lines"` // added plus removed lines folded
+	Reason string `json:"reason,omitempty"`
+}
+
+// Result is a skimmed patch and what was folded out of it.
+type Result struct {
+	Patch   *patch.Patch
+	Folds   []Fold
+	Changed int // added plus removed lines in the input
+	Kept    int // added plus removed lines in the output
+	// Unchecked counts changed lines in JS/TS/Go files that the import and
+	// format rules could not check because the file contents were not
+	// available.
+	Unchecked int
+}
+
+// Skim folds p. It does not modify p.
+func Skim(p *patch.Patch, src Source) Result {
+	s := &skimmer{src: src, r: Result{Patch: &patch.Patch{Preamble: p.Preamble}, Changed: p.Changed()}}
+	for _, f := range p.Files {
+		if out := s.file(f); out != nil {
+			s.r.Patch.Files = append(s.r.Patch.Files, out)
+		}
+	}
+	s.r.Kept = s.r.Patch.Changed()
+	return s.r
+}
+
+type skimmer struct {
+	src     Source
+	r       Result
+	pending []Fold // folded since the last kept hunk
+}
+
+func (s *skimmer) fold(f Fold) {
+	s.r.Folds = append(s.r.Folds, f)
+	s.pending = append(s.pending, f)
+}
+
+// keep returns h with a note on the folds before it in its heading.
+func (s *skimmer) keep(h *patch.Hunk) *patch.Hunk {
+	if note := foldNote(s.pending); note != "" {
+		h.Heading = " " + note + h.Heading
+		s.pending = nil
+	}
+	return h
+}
+
+// foldNote is the text added to a kept hunk's heading for the folds before it.
+func foldNote(folds []Fold) string {
+	if len(folds) == 0 {
+		return ""
+	}
+	var parts []string
+	for _, rule := range Rules {
+		n := 0
+		for _, f := range folds {
+			if f.Rule == rule {
+				n += f.Lines
+			}
+		}
+		if n > 0 {
+			parts = append(parts, fmt.Sprintf("%s %d %s", rule, n, plural(n, "line")))
+		}
+	}
+	return "[folded above: " + strings.Join(parts, ", ") + "]"
+}
+
+func plural(n int, word string) string {
+	if n == 1 {
+		return word
+	}
+	return word + "s"
+}
+
+// file returns f as it should be printed, or nil when nothing of it is left.
+func (s *skimmer) file(f *patch.File) *patch.File {
+	src := s.src
+	whole := func(rule Rule, reason string) *patch.File {
+		s.fold(Fold{Path: f.Path(), Rule: rule, Lines: f.Changed(), Reason: reason})
+		return nil
+	}
+	if isLockfile(f.Path()) {
+		return whole(Lockfile, "")
+	}
+	if pat := generatedByName(f.Path()); pat != "" {
+		return whole(Generated, pat)
+	}
+	if src != nil && src.LinguistGenerated(f.Path()) {
+		return whole(Generated, "linguist-generated")
+	}
+	if f.Opaque {
+		return f
+	}
+	oldContent, newContent, haveContent := contents(f, src)
+	side := newContent
+	if f.NewPath == "" {
+		side = oldContent
+	}
+	if haveContent {
+		if m := generatedMarker(side); m != "" {
+			return whole(Generated, m)
+		}
+	} else if len(f.Hunks) > 0 && f.Hunks[0].NewStart <= 1 {
+		if m := generatedMarker([]byte(firstLines(f.Hunks[0]))); m != "" {
+			return whole(Generated, m)
+		}
+	}
+
+	lang := language(f.Path())
+	var oldA, newA *analysis
+	if lang != "" && haveContent {
+		oldA, newA = analyze(lang, oldContent), analyze(lang, newContent)
+	}
+	out := *f
+	out.Hunks = nil
+	for _, h := range f.Hunks {
+		blocks := splitHunk(h)
+		for i := range blocks {
+			b := &blocks[i]
+			b.rule = classify(f, h, b, lang, oldA, newA)
+			if b.rule == "" && lang != "" && !haveContent {
+				s.r.Unchecked += b.end - b.start
+			}
+		}
+		out.Hunks = append(out.Hunks, s.keptHunks(f, h, blocks)...)
+	}
+	if len(out.Hunks) == 0 && len(f.Hunks) > 0 && !hasMetadataChange(f) {
+		return nil
+	}
+	return &out
+}
+
+// hasMetadataChange reports whether the file header says more than "the
+// content changed": a rename, copy, mode change, creation or deletion.
+func hasMetadataChange(f *patch.File) bool {
+	for _, l := range f.Header {
+		for _, p := range []string{"rename from ", "copy from ", "old mode ", "new file mode ", "deleted file mode "} {
+			if strings.HasPrefix(l, p) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func firstLines(h *patch.Hunk) string {
+	var b strings.Builder
+	for _, l := range h.Lines {
+		if l.Kind != '-' {
+			b.WriteString(l.Text)
+			b.WriteByte('\n')
+		}
+	}
+	return b.String()
+}
+
+// contents fetches both sides of f and checks that they match the hunks, so
+// a stale or unrelated file can never feed the rules.
+func contents(f *patch.File, src Source) (oldC, newC []byte, ok bool) {
+	if src == nil {
+		return nil, nil, false
+	}
+	if f.OldPath != "" {
+		if oldC, ok = src.Content(f, false); !ok {
+			return nil, nil, false
+		}
+	}
+	if f.NewPath != "" {
+		if newC, ok = src.Content(f, true); !ok {
+			return nil, nil, false
+		}
+	}
+	oldLines, newLines := splitLines(oldC), splitLines(newC)
+	for _, h := range f.Hunks {
+		o, n := start(h.OldStart, h.OldLines), start(h.NewStart, h.NewLines)
+		for _, l := range h.Lines {
+			if l.Kind != '+' {
+				if o > len(oldLines) || oldLines[o-1] != l.Text {
+					return nil, nil, false
+				}
+				o++
+			}
+			if l.Kind != '-' {
+				if n > len(newLines) || newLines[n-1] != l.Text {
+					return nil, nil, false
+				}
+				n++
+			}
+		}
+	}
+	return oldC, newC, true
+}
+
+func splitLines(b []byte) []string {
+	if len(b) == 0 {
+		return nil
+	}
+	return strings.Split(string(bytes.TrimSuffix(b, []byte("\n"))), "\n")
+}
+
+// start is the line number of the first line of a hunk side. A side with no
+// lines names the line before the change, so its first line would be next.
+func start(s, n int) int {
+	if n == 0 {
+		return s + 1
+	}
+	return s
+}
+
+// block is one run of changed lines in a hunk, with the context around it.
+type block struct {
+	start, end   int // the changed lines are h.Lines[start:end]
+	ctxStart     int // context before the block starts here (end of the previous block)
+	ctxEnd       int // context after the block ends here (start of the next block)
+	oldNo, newNo []int
+	newLine      int // new-side line number where the block starts
+	rule         Rule
+}
+
+func splitHunk(h *patch.Hunk) []block {
+	oldNo := make([]int, len(h.Lines)) // line number on the old side, 0 if absent
+	newNo := make([]int, len(h.Lines))
+	o, n := start(h.OldStart, h.OldLines), start(h.NewStart, h.NewLines)
+	var blocks []block
+	for i, l := range h.Lines {
+		if l.Kind != '+' {
+			oldNo[i] = o
+			o++
+		}
+		if l.Kind != '-' {
+			newNo[i] = n
+			n++
+		}
+		if l.Kind == ' ' {
+			continue
+		}
+		if len(blocks) > 0 && blocks[len(blocks)-1].end == i {
+			blocks[len(blocks)-1].end++
+			continue
+		}
+		blocks = append(blocks, block{start: i, end: i + 1, newLine: n - 1})
+		if l.Kind == '-' {
+			blocks[len(blocks)-1].newLine = n
+		}
+	}
+	for i := range blocks {
+		b := &blocks[i]
+		b.oldNo, b.newNo = oldNo, newNo
+		if i > 0 {
+			b.ctxStart = blocks[i-1].end
+		}
+		b.ctxEnd = len(h.Lines)
+		if i+1 < len(blocks) {
+			b.ctxEnd = blocks[i+1].start
+		}
+	}
+	return blocks
+}
+
+func classify(f *patch.File, h *patch.Hunk, b *block, lang string, oldA, newA *analysis) Rule {
+	var removed, added []string
+	var removedNo, addedNo []int
+	for i := b.start; i < b.end; i++ {
+		l := h.Lines[i]
+		if l.Kind == '-' {
+			removed = append(removed, l.Text)
+			removedNo = append(removedNo, b.oldNo[i])
+		} else {
+			added = append(added, l.Text)
+			addedNo = append(addedNo, b.newNo[i])
+		}
+	}
+	if !whitespaceSensitive(f.Path()) && whitespaceOnly(removed, added) {
+		return Whitespace
+	}
+	if oldA == nil || newA == nil {
+		return ""
+	}
+	if importOnly(removed, removedNo, oldA) && importOnly(added, addedNo, newA) &&
+		(anyIn(removedNo, oldA.imports) || anyIn(addedNo, newA.imports)) &&
+		slices.Equal(sideEffects(removedNo, oldA), sideEffects(addedNo, newA)) {
+		return Imports
+	}
+	if lang == "go" {
+		return ""
+	}
+	// Compare the block and the context around it, so a change that makes
+	// the parser read an unchanged neighbour differently is seen too.
+	oLo, oHi := span(b.oldNo[b.ctxStart:b.ctxEnd])
+	nLo, nHi := span(b.newNo[b.ctxStart:b.ctxEnd])
+	if hasLines(oldA.errors, oLo, oHi) || hasLines(newA.errors, nLo, nHi) {
+		return ""
+	}
+	if sameTokens(oldA.tokens, oLo, oHi, newA.tokens, nLo, nHi) {
+		return Format
+	}
+	return ""
+}
+
+// importOnly reports whether every line is blank or part of an import.
+func importOnly(texts []string, nos []int, a *analysis) bool {
+	for i, no := range nos {
+		if a.errors[no] {
+			return false
+		}
+		_, sideEffect := a.sideEffect[no]
+		if !a.imports[no] && !sideEffect && strings.TrimSpace(texts[i]) != "" {
+			return false
+		}
+	}
+	return true
+}
+
+// sideEffects lists the imports that only run code and start on the given
+// lines. Adding, removing or reordering them changes what the program does,
+// so the import rule needs the same list on both sides.
+func sideEffects(nos []int, a *analysis) []string {
+	var out []string
+	for _, no := range nos {
+		if s := a.sideEffect[no]; s != "" {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+func anyIn(nos []int, m map[int]bool) bool {
+	for _, no := range nos {
+		if m[no] {
+			return true
+		}
+	}
+	return false
+}
+
+// span returns the smallest and largest non-zero line number, or 0, -1.
+func span(nos []int) (int, int) {
+	lo, hi := 0, -1
+	for _, n := range nos {
+		if n == 0 {
+			continue
+		}
+		if lo == 0 || n < lo {
+			lo = n
+		}
+		if n > hi {
+			hi = n
+		}
+	}
+	return lo, hi
+}
+
+func hasLines(m map[int]bool, lo, hi int) bool {
+	for i := lo; i <= hi; i++ {
+		if m[i] {
+			return true
+		}
+	}
+	return false
+}
+
+func sameTokens(a []tok, aLo, aHi int, b []tok, bLo, bHi int) bool {
+	x, y := within(a, aLo, aHi), within(b, bLo, bHi)
+	if len(x) != len(y) {
+		return false
+	}
+	for i := range x {
+		if x[i].text != y[i].text {
+			return false
+		}
+	}
+	return true
+}
+
+// within returns the tokens that touch lines lo..hi.
+func within(ts []tok, lo, hi int) []tok {
+	var out []tok
+	for _, t := range ts {
+		if t.last >= lo && t.first <= hi {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// keptHunks rebuilds h from its kept blocks. Each run of kept blocks becomes
+// one hunk with all the context around it; folded blocks are left out, so
+// applying the result leaves their lines as they were. A hunk with nothing
+// folded comes back unchanged.
+func (s *skimmer) keptHunks(f *patch.File, h *patch.Hunk, blocks []block) []*patch.Hunk {
+	allKept := true
+	for _, b := range blocks {
+		if b.rule != "" {
+			allKept = false
+		}
+	}
+	if allKept {
+		c := *h
+		return []*patch.Hunk{s.keep(&c)}
+	}
+	var out []*patch.Hunk
+	for i := 0; i < len(blocks); {
+		if b := blocks[i]; b.rule != "" {
+			s.fold(Fold{Path: f.Path(), Line: b.newLine, Rule: b.rule, Lines: b.end - b.start})
+			i++
+			continue
+		}
+		j := i
+		for j+1 < len(blocks) && blocks[j+1].rule == "" {
+			j++
+		}
+		lo, hi := blocks[i].ctxStart, blocks[j].ctxEnd
+		out = append(out, s.keep(subHunk(h, blocks[i], lo, hi)))
+		i = j + 1
+	}
+	return out
+}
+
+func subHunk(h *patch.Hunk, b block, lo, hi int) *patch.Hunk {
+	s := &patch.Hunk{Heading: h.Heading, Lines: h.Lines[lo:hi]}
+	oldFirst, newFirst := 0, 0
+	for i := lo; i < hi; i++ {
+		if b.oldNo[i] != 0 {
+			if oldFirst == 0 {
+				oldFirst = b.oldNo[i]
+			}
+			s.OldLines++
+		}
+		if b.newNo[i] != 0 {
+			if newFirst == 0 {
+				newFirst = b.newNo[i]
+			}
+			s.NewLines++
+		}
+	}
+	s.OldStart, s.NewStart = oldFirst, newFirst
+	if s.OldLines == 0 {
+		s.OldStart = positionBefore(h, b.oldNo, lo, true)
+	}
+	if s.NewLines == 0 {
+		s.NewStart = positionBefore(h, b.newNo, lo, false)
+	}
+	return s
+}
+
+// positionBefore is the number of the last line on one side before index lo,
+// which is how a hunk side with no lines names its position.
+func positionBefore(h *patch.Hunk, nos []int, lo int, old bool) int {
+	for i := lo - 1; i >= 0; i-- {
+		if nos[i] != 0 {
+			return nos[i]
+		}
+	}
+	if old {
+		return start(h.OldStart, h.OldLines) - 1
+	}
+	return start(h.NewStart, h.NewLines) - 1
+}
