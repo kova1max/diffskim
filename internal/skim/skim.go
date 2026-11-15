@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"fmt"
 	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/kova1max/diffskim/internal/patch"
@@ -66,11 +67,19 @@ func (s *skimmer) fold(f Fold) {
 	s.pending = append(s.pending, f)
 }
 
-// keep returns h with a note on the folds before it in its heading.
-func (s *skimmer) keep(h *patch.Hunk) *patch.Hunk {
+// keep returns h with a note in its heading on the folds before it and the
+// whitespace-only lines folded inside it.
+func (s *skimmer) keep(h *patch.Hunk, here []Fold) *patch.Hunk {
+	var notes []string
 	if note := foldNote(s.pending); note != "" {
-		h.Heading = " " + note + h.Heading
+		notes = append(notes, "[folded above: "+note+"]")
 		s.pending = nil
+	}
+	if note := foldNote(here); note != "" {
+		notes = append(notes, "[folded here: "+note+"]")
+	}
+	if len(notes) > 0 {
+		h.Heading = " " + strings.Join(notes, " ") + h.Heading
 	}
 	return h
 }
@@ -92,7 +101,7 @@ func foldNote(folds []Fold) string {
 			parts = append(parts, fmt.Sprintf("%s %d %s", rule, n, plural(n, "line")))
 		}
 	}
-	return "[folded above: " + strings.Join(parts, ", ") + "]"
+	return strings.Join(parts, ", ")
 }
 
 func plural(n int, word string) string {
@@ -150,6 +159,9 @@ func (s *skimmer) file(f *patch.File) *patch.File {
 			b.rule = classify(f, h, b, lang, oldA, newA)
 			if b.rule == "" && lang != "" && !haveContent {
 				s.r.Unchecked += b.end - b.start
+			}
+			if b.rule == "" && !whitespaceSensitive(f.Path()) {
+				b.lines, b.wsLines, b.wsLine = foldWhitespaceLines(h.Lines[b.start:b.end], b.newNo[b.start:b.end])
 			}
 		}
 		out.Hunks = append(out.Hunks, s.keptHunks(f, h, blocks)...)
@@ -245,6 +257,12 @@ type block struct {
 	oldNo, newNo []int
 	newLine      int // new-side line number where the block starts
 	rule         Rule
+	// A kept block may still contain lines that only changed whitespace.
+	// lines is then the block with those lines turned into context, wsLines
+	// counts the added and removed lines that went, and wsLine is the
+	// new-side line number of the first of them.
+	lines           []patch.Line
+	wsLines, wsLine int
 }
 
 func splitHunk(h *patch.Hunk) []block {
@@ -420,13 +438,13 @@ func within(ts []tok, lo, hi int) []tok {
 func (s *skimmer) keptHunks(f *patch.File, h *patch.Hunk, blocks []block) []*patch.Hunk {
 	allKept := true
 	for _, b := range blocks {
-		if b.rule != "" {
+		if b.rule != "" || b.lines != nil {
 			allKept = false
 		}
 	}
 	if allKept {
 		c := *h
-		return []*patch.Hunk{s.keep(&c)}
+		return []*patch.Hunk{s.keep(&c, nil)}
 	}
 	var out []*patch.Hunk
 	for i := 0; i < len(blocks); {
@@ -439,38 +457,138 @@ func (s *skimmer) keptHunks(f *patch.File, h *patch.Hunk, blocks []block) []*pat
 		for j+1 < len(blocks) && blocks[j+1].rule == "" {
 			j++
 		}
-		lo, hi := blocks[i].ctxStart, blocks[j].ctxEnd
-		out = append(out, s.keep(subHunk(h, blocks[i], lo, hi)))
+		var here []Fold
+		for _, b := range blocks[i : j+1] {
+			if b.wsLines > 0 {
+				f := Fold{Path: f.Path(), Line: b.wsLine, Rule: Whitespace, Lines: b.wsLines}
+				s.r.Folds = append(s.r.Folds, f)
+				here = append(here, f)
+			}
+		}
+		out = append(out, s.keep(subHunk(h, blocks[i:j+1]), here))
 		i = j + 1
 	}
 	return out
 }
 
-func subHunk(h *patch.Hunk, b block, lo, hi int) *patch.Hunk {
-	s := &patch.Hunk{Heading: h.Heading, Lines: h.Lines[lo:hi]}
-	oldFirst, newFirst := 0, 0
-	for i := lo; i < hi; i++ {
-		if b.oldNo[i] != 0 {
-			if oldFirst == 0 {
-				oldFirst = b.oldNo[i]
+// subHunk builds the hunk for a run of kept blocks and all the context
+// around them.
+func subHunk(h *patch.Hunk, blocks []block) *patch.Hunk {
+	first, last := blocks[0], blocks[len(blocks)-1]
+	lo, hi := first.ctxStart, last.ctxEnd
+	s := &patch.Hunk{Heading: h.Heading}
+	for i, k := lo, 0; i < hi; {
+		if k < len(blocks) && i == blocks[k].start {
+			b := blocks[k]
+			if b.lines != nil {
+				s.Lines = append(s.Lines, b.lines...)
+			} else {
+				s.Lines = append(s.Lines, h.Lines[b.start:b.end]...)
 			}
+			i = b.end
+			k++
+			continue
+		}
+		s.Lines = append(s.Lines, h.Lines[i])
+		i++
+	}
+	for _, l := range s.Lines {
+		if l.Kind != '+' {
 			s.OldLines++
 		}
-		if b.newNo[i] != 0 {
-			if newFirst == 0 {
-				newFirst = b.newNo[i]
-			}
+		if l.Kind != '-' {
 			s.NewLines++
 		}
 	}
-	s.OldStart, s.NewStart = oldFirst, newFirst
+	s.OldStart = firstNo(first.oldNo, lo, hi)
+	s.NewStart = firstNo(first.newNo, lo, hi)
 	if s.OldLines == 0 {
-		s.OldStart = positionBefore(h, b.oldNo, lo, true)
+		s.OldStart = positionBefore(h, first.oldNo, lo, true)
 	}
 	if s.NewLines == 0 {
-		s.NewStart = positionBefore(h, b.newNo, lo, false)
+		s.NewStart = positionBefore(h, first.newNo, lo, false)
 	}
 	return s
+}
+
+func firstNo(nos []int, lo, hi int) int {
+	for i := lo; i < hi; i++ {
+		if nos[i] != 0 {
+			return nos[i]
+		}
+	}
+	return 0
+}
+
+// foldWhitespaceLines pairs removed and added lines that are equal once
+// whitespace is stripped (a longest common subsequence, as git diff -w would
+// pair them) and turns each pair into one context line with the old text.
+// It returns nil when no pair is found.
+func foldWhitespaceLines(ls []patch.Line, newNo []int) ([]patch.Line, int, int) {
+	var rem, add []int // indices into ls
+	for i, l := range ls {
+		if l.Kind == '-' {
+			rem = append(rem, i)
+		} else {
+			add = append(add, i)
+		}
+	}
+	key := func(i int) string {
+		if ls[i].NoEOL != "" {
+			return "\x00" + strconv.Itoa(i) // never pair a line whose final newline changed
+		}
+		return stripSpace(ls[i].Text)
+	}
+	n, m := len(rem), len(add)
+	if n == 0 || m == 0 || n*m > 4_000_000 {
+		return nil, 0, 0
+	}
+	// lcs[i][j] is the LCS length of rem[i:] and add[j:].
+	lcs := make([][]int32, n+1)
+	for i := range lcs {
+		lcs[i] = make([]int32, m+1)
+	}
+	for i := n - 1; i >= 0; i-- {
+		for j := m - 1; j >= 0; j-- {
+			if key(rem[i]) == key(add[j]) {
+				lcs[i][j] = lcs[i+1][j+1] + 1
+			} else {
+				lcs[i][j] = max(lcs[i+1][j], lcs[i][j+1])
+			}
+		}
+	}
+	if lcs[0][0] == 0 {
+		return nil, 0, 0
+	}
+	var out []patch.Line
+	folded, firstLine := 0, 0
+	i, j := 0, 0
+	var pendRem, pendAdd []patch.Line
+	flush := func() {
+		out = append(append(out, pendRem...), pendAdd...)
+		pendRem, pendAdd = nil, nil
+	}
+	for i < n || j < m {
+		switch {
+		case i < n && j < m && key(rem[i]) == key(add[j]) && lcs[i][j] == lcs[i+1][j+1]+1:
+			flush()
+			out = append(out, patch.Line{Kind: ' ', Text: ls[rem[i]].Text})
+			if firstLine == 0 {
+				firstLine = newNo[add[j]]
+			}
+			folded += 2
+			i++
+			j++
+		case j >= m || (i < n && lcs[i+1][j] >= lcs[i][j+1]):
+			pendRem = append(pendRem, ls[rem[i]])
+			i++
+		default:
+			pendAdd = append(pendAdd, ls[add[j]])
+			j++
+		}
+	}
+	flush()
+	return out, folded, firstLine
 }
 
 // positionBefore is the number of the last line on one side before index lo,
