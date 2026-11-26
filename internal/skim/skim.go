@@ -47,9 +47,15 @@ type Result struct {
 // Skim folds p. It does not modify p.
 func Skim(p *patch.Patch, src Source) Result {
 	s := &skimmer{src: src, r: Result{Patch: &patch.Patch{Preamble: p.Preamble}, Changed: p.Changed()}}
+	out := s.r.Patch
 	for _, f := range p.Files {
-		if out := s.file(f); out != nil {
-			s.r.Patch.Files = append(s.r.Patch.Files, out)
+		if kept := s.file(f); kept != nil {
+			out.Files = append(out.Files, kept)
+		} else if len(out.Files) > 0 {
+			last := out.Files[len(out.Files)-1]
+			last.Trailer = slices.Concat(last.Trailer, f.Trailer)
+		} else {
+			out.Preamble = slices.Concat(out.Preamble, f.Trailer)
 		}
 	}
 	s.r.Kept = s.r.Patch.Changed()
@@ -128,7 +134,8 @@ func (s *skimmer) file(f *patch.File) *patch.File {
 		return whole(Generated, "linguist-generated")
 	}
 	if f.Opaque {
-		return f
+		c := *f
+		return &c
 	}
 	oldContent, newContent, haveContent := contents(f, src)
 	side := newContent
@@ -150,17 +157,30 @@ func (s *skimmer) file(f *patch.File) *patch.File {
 	if lang != "" && haveContent {
 		oldA, newA = analyze(lang, oldContent), analyze(lang, newContent)
 	}
+	// Where the format rule can compare syntax trees, it decides alone:
+	// whitespace inside a string or between two tokens can matter.
+	wsRule := !whitespaceSensitive(f.Path()) && (oldA == nil || newA == nil || lang == "go")
 	out := *f
 	out.Hunks = nil
 	for _, h := range f.Hunks {
 		blocks := splitHunk(h)
 		for i := range blocks {
 			b := &blocks[i]
-			b.rule = classify(f, h, b, lang, oldA, newA)
+			b.rule = classify(h, b, wsRule, lang, oldA, newA)
 			if b.rule == "" && lang != "" && !haveContent {
 				s.r.Unchecked += b.end - b.start
 			}
-			if b.rule == "" && !whitespaceSensitive(f.Path()) {
+		}
+		if !sameImports(h, blocks, oldA, newA) {
+			for i := range blocks {
+				if blocks[i].rule == Imports {
+					blocks[i].rule = ""
+				}
+			}
+		}
+		for i := range blocks {
+			b := &blocks[i]
+			if b.rule == "" && wsRule {
 				b.lines, b.wsLines, b.wsLine = foldWhitespaceLines(h.Lines[b.start:b.end], b.newNo[b.start:b.end])
 			}
 		}
@@ -305,7 +325,7 @@ func splitHunk(h *patch.Hunk) []block {
 	return blocks
 }
 
-func classify(f *patch.File, h *patch.Hunk, b *block, lang string, oldA, newA *analysis) Rule {
+func classify(h *patch.Hunk, b *block, wsRule bool, lang string, oldA, newA *analysis) Rule {
 	var removed, added []string
 	var removedNo, addedNo []int
 	for i := b.start; i < b.end; i++ {
@@ -318,7 +338,7 @@ func classify(f *patch.File, h *patch.Hunk, b *block, lang string, oldA, newA *a
 			addedNo = append(addedNo, b.newNo[i])
 		}
 	}
-	if !whitespaceSensitive(f.Path()) && whitespaceOnly(removed, added) {
+	if wsRule && whitespaceOnly(removed, added) {
 		return Whitespace
 	}
 	if oldA == nil || newA == nil {
@@ -343,6 +363,36 @@ func classify(f *patch.File, h *patch.Hunk, b *block, lang string, oldA, newA *a
 		return Format
 	}
 	return ""
+}
+
+// sameImports reports whether the import statements that the hunk's
+// import-only blocks touch are the same on both sides once formatting and
+// order are ignored, so the blocks only reorder or re-wrap imports.
+func sameImports(h *patch.Hunk, blocks []block, oldA, newA *analysis) bool {
+	oldStmts, newStmts := map[int]bool{}, map[int]bool{}
+	for _, b := range blocks {
+		if b.rule != Imports {
+			continue
+		}
+		for i := b.start; i < b.end; i++ {
+			if h.Lines[i].Kind == '-' {
+				if k, ok := oldA.importOf[b.oldNo[i]]; ok {
+					oldStmts[k] = true
+				}
+			} else if k, ok := newA.importOf[b.newNo[i]]; ok {
+				newStmts[k] = true
+			}
+		}
+	}
+	keys := func(stmts map[int]bool, a *analysis) []string {
+		var out []string
+		for k := range stmts {
+			out = append(out, a.importKeys[k])
+		}
+		slices.Sort(out)
+		return out
+	}
+	return slices.Equal(keys(oldStmts, oldA), keys(newStmts, newA))
 }
 
 // importOnly reports whether every line is blank or part of an import.
@@ -521,8 +571,8 @@ func firstNo(nos []int, lo, hi int) int {
 }
 
 // foldWhitespaceLines pairs removed and added lines that are equal once
-// whitespace is stripped (a longest common subsequence, as git diff -w would
-// pair them) and turns each pair into one context line with the old text.
+// whitespace is collapsed (a longest common subsequence, as git diff pairs
+// lines) and turns each pair into one context line with the old text.
 // It returns nil when no pair is found.
 func foldWhitespaceLines(ls []patch.Line, newNo []int) ([]patch.Line, int, int) {
 	var rem, add []int // indices into ls
@@ -537,7 +587,7 @@ func foldWhitespaceLines(ls []patch.Line, newNo []int) ([]patch.Line, int, int) 
 		if ls[i].NoEOL != "" {
 			return "\x00" + strconv.Itoa(i) // never pair a line whose final newline changed
 		}
-		return stripSpace(ls[i].Text)
+		return collapseSpace(ls[i].Text)
 	}
 	n, m := len(rem), len(add)
 	if n == 0 || m == 0 || n*m > 4_000_000 {

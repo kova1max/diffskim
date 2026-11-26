@@ -169,18 +169,48 @@ func TestFolds(t *testing.T) {
 			new:  "const a = <p>goodbye</p>\n",
 		},
 		{
+			name: "reordered imports",
+			path: "a.ts",
+			old:  "import { b } from './b'\nimport { a } from './a'\n\nrun(a, b)\n",
+			new:  "import { a } from './a'\nimport { b } from './b'\n\nrun(a, b)\n",
+			want: "import-only",
+		},
+		{
 			name: "reordered and added imports",
 			path: "a.ts",
 			old:  "import { b } from './b'\nimport { a } from './a'\n\nrun(a, b)\n",
 			new:  "import { a } from './a'\nimport { b } from './b'\nimport { c } from './c'\n\nrun(a, b)\n",
+		},
+		{
+			name: "removed import",
+			path: "a.ts",
+			old:  "import { a } from './a'\nimport { b } from './b'\n\nrun(a)\n",
+			new:  "import { a } from './a'\n\nrun(a)\n",
+		},
+		{
+			name: "re-wrapped import with bindings reordered",
+			path: "a.tsx",
+			old:  "import { b, a } from './x'\n\nrun(a, b)\n",
+			new:  "import {\n  a,\n  b,\n} from './x';\n\nrun(a, b)\n",
 			want: "import-only",
 		},
 		{
-			name: "multi-line import",
+			name: "binding added to a multi-line import",
 			path: "a.tsx",
 			old:  "import { a, b } from './x'\n\nrun(a, b)\n",
 			new:  "import {\n  a,\n  b,\n  c,\n} from './x'\n\nrun(a, b)\n",
-			want: "import-only",
+		},
+		{
+			name: "import source swapped",
+			path: "a.ts",
+			old:  "import { sign } from 'jsonwebtoken'\n\nsign(x)\n",
+			new:  "import { sign } from './sign'\n\nsign(x)\n",
+		},
+		{
+			name: "binding renamed",
+			path: "a.ts",
+			old:  "import { a as b } from './x'\n\nrun(b)\n",
+			new:  "import { b as a } from './x'\n\nrun(b)\n",
 		},
 		{
 			name: "side-effect imports reordered",
@@ -208,10 +238,29 @@ func TestFolds(t *testing.T) {
 			new:  "export { a, b } from './a'\n",
 		},
 		{
-			name: "Go imports",
+			name: "Go imports sorted",
+			path: "a.go",
+			old:  "package a\n\nimport (\n\t\"os\"\n\t\"fmt\"\n)\n\nvar _ = fmt.Sprint(os.Args)\n",
+			new:  "package a\n\nimport (\n\t\"fmt\"\n\t\"os\"\n)\n\nvar _ = fmt.Sprint(os.Args)\n",
+			want: "import-only",
+		},
+		{
+			name: "Go import added",
 			path: "a.go",
 			old:  "package a\n\nimport (\n\t\"os\"\n\t\"fmt\"\n)\n\nvar _ = fmt.Sprint(os.Args)\n",
 			new:  "package a\n\nimport (\n\t\"fmt\"\n\t\"os\"\n\t\"strings\"\n)\n\nvar _ = fmt.Sprint(os.Args)\n",
+		},
+		{
+			name: "Go import source swapped",
+			path: "a.go",
+			old:  "package a\n\nimport \"crypto/rand\"\n\nvar _ = rand.Read\n",
+			new:  "package a\n\nimport \"math/rand\"\n\nvar _ = rand.Read\n",
+		},
+		{
+			name: "Go import grouped",
+			path: "a.go",
+			old:  "package a\n\nimport \"fmt\"\n\nvar _ = fmt.Sprint\n",
+			new:  "package a\n\nimport (\n\t\"fmt\"\n)\n\nvar _ = fmt.Sprint\n",
 			want: "import-only",
 		},
 		{
@@ -225,6 +274,44 @@ func TestFolds(t *testing.T) {
 			path: "a.c",
 			old:  "int f() {\nreturn 1;\n}\n",
 			new:  "int f() {\n    return 1;\n}\n",
+			want: "whitespace-only",
+		},
+		{
+			name: "space removed inside a string",
+			path: "a.ts",
+			old:  "const sep = \", \"\n",
+			new:  "const sep = \",\"\n",
+		},
+		{
+			name: "space removed between words",
+			path: "a.ts",
+			old:  "const q = sql`SELECT a FROM b`\n",
+			new:  "const q = sql`SELECTa FROMb`\n",
+		},
+		{
+			name: "re-indented TypeScript",
+			path: "a.ts",
+			old:  "function f() {\nreturn 1\n}\n",
+			new:  "function f() {\n  return 1\n}\n",
+			want: "format-only",
+		},
+		{
+			name: "space removed inside a C string",
+			path: "a.c",
+			old:  "const char *sep = \", \";\n",
+			new:  "const char *sep = \",\";\n",
+		},
+		{
+			name: "space removed between SQL words",
+			path: "a.sql",
+			old:  "SELECT a FROM b;\n",
+			new:  "SELECTa FROMb;\n",
+		},
+		{
+			name: "runs of spaces collapsed",
+			path: "a.sql",
+			old:  "SELECT a  FROM\tb;\n",
+			new:  "  SELECT a FROM b; \n",
 			want: "whitespace-only",
 		},
 		{
@@ -351,5 +438,115 @@ func TestLinguistGenerated(t *testing.T) {
 	r := Skim(p, files{generated: map[string]bool{"gen/schema.ts": true}})
 	if rules(r) != "generated" || r.Folds[0].Reason != "linguist-generated" || len(r.Patch.Files) != 0 {
 		t.Errorf("got %+v", r)
+	}
+}
+
+func TestMixedBlockKeepsSpaceChangesInsideStrings(t *testing.T) {
+	r := skimOne(t, "a.c",
+		"int f() {\nputs(\"a, b\");\nreturn 1;\n}\n",
+		"int f() {\n    puts(\"a,b\");\n    return 2;\n}\n")
+	if len(r.Folds) != 0 || r.Kept != 4 {
+		t.Errorf("folds %+v kept %d, want none and 4", r.Folds, r.Kept)
+	}
+}
+
+func TestFoldedFileKeepsItsTrailer(t *testing.T) {
+	log := `commit 2222222222222222222222222222222222222222
+Author: t <t@example.com>
+
+    second
+
+diff --git a/a.c b/a.c
+--- a/a.c
++++ b/a.c
+@@ -1 +1 @@
+-int a = 1;
++int a = 2;
+diff --git a/yarn.lock b/yarn.lock
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -1 +1 @@
+-a 1
++a 2
+
+commit 1111111111111111111111111111111111111111
+Author: t <t@example.com>
+
+    first
+
+diff --git a/yarn.lock b/yarn.lock
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -1 +1 @@
+-a 0
++a 1
+
+commit 0000000000000000000000000000000000000000
+Author: t <t@example.com>
+
+    zeroth
+
+diff --git a/b.c b/b.c
+--- a/b.c
++++ b/b.c
+@@ -1 +1 @@
+-int b = 1;
++int b = 2;
+`
+	p, err := patch.Parse(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	r := Skim(p, nil)
+	var out bytes.Buffer
+	r.Patch.Write(&out)
+	for _, want := range []string{"    second\n", "+int a = 2;\n\ncommit 1111", "    first\n\n\ncommit 0000", "    zeroth\n\ndiff --git a/b.c"} {
+		if !strings.Contains(out.String(), want) {
+			t.Errorf("output lost %q:\n%s", want, out.String())
+		}
+	}
+	if strings.Contains(out.String(), "yarn.lock") {
+		t.Errorf("lockfile left in the output:\n%s", out.String())
+	}
+	var orig bytes.Buffer
+	p.Write(&orig)
+	if orig.String() != log {
+		t.Errorf("Skim modified its input")
+	}
+}
+
+func TestFoldedFirstFileKeepsItsTrailer(t *testing.T) {
+	log := `commit 1111111111111111111111111111111111111111
+
+    first
+
+diff --git a/yarn.lock b/yarn.lock
+--- a/yarn.lock
++++ b/yarn.lock
+@@ -1 +1 @@
+-a 0
++a 1
+
+commit 0000000000000000000000000000000000000000
+
+    zeroth
+
+diff --git a/b.c b/b.c
+--- a/b.c
++++ b/b.c
+@@ -1 +1 @@
+-int b = 1;
++int b = 2;
+`
+	p, err := patch.Parse(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	Skim(p, nil).Patch.Write(&out)
+	want := strings.Replace(log, "diff --git a/yarn.lock b/yarn.lock\n--- a/yarn.lock\n+++ b/yarn.lock\n@@ -1 +1 @@\n-a 0\n+a 1\n", "", 1)
+	want = strings.Replace(want, "+++ b/b.c\n@@ -1 +1 @@\n", "+++ b/b.c\n@@ -1 +1 @@ [folded above: lockfile 2 lines]\n", 1)
+	if out.String() != want {
+		t.Errorf("got\n%s\nwant\n%s", out.String(), want)
 	}
 }

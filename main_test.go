@@ -107,6 +107,23 @@ func TestGitMode(t *testing.T) {
 	}
 }
 
+func TestGitModeWithPathsWithoutDoubleDash(t *testing.T) {
+	repoWithChanges(t)
+	for _, args := range [][]string{{"HEAD", "src/user.ts"}, {"src/user.ts"}} {
+		out, errOut, code := runCLI(t, "", args...)
+		if code != 0 {
+			t.Fatalf("%v: exit %d: %s", args, code, errOut)
+		}
+		if !strings.Contains(out, "+  return user.role !== 'guest';") || strings.Contains(out, "user.pb.go") {
+			t.Errorf("%v: output not limited to src/user.ts:\n%s", args, out)
+		}
+		want := "diffskim: 8 changed lines -> 2 kept (git diff -M -w + lockfile excludes: 8); folded import-only 4, format-only 2\n"
+		if errOut != want {
+			t.Errorf("%v: summary\n got %q\nwant %q", args, errOut, want)
+		}
+	}
+}
+
 func TestStdinModeMatchesGitMode(t *testing.T) {
 	repoWithChanges(t)
 	diff, err := exec.Command("git", "diff", "HEAD").Output()

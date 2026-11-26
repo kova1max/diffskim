@@ -5,6 +5,7 @@ import (
 	"go/parser"
 	"go/token"
 	"path"
+	"slices"
 	"strings"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
@@ -21,7 +22,12 @@ type analysis struct {
 	// or to "" on its other lines.
 	sideEffect map[int]string
 	errors     map[int]bool // lines the parser could not make sense of
-	tokens     []tok        // nil when the format rule does not apply
+	// importOf maps every line of an import statement to its index in
+	// importKeys, which hold each statement's source and bindings with
+	// formatting and binding order normalized away.
+	importOf   map[int]int
+	importKeys []string
+	tokens     []tok // nil when the format rule does not apply
 }
 
 // tok is one entry of a file's normalized token stream: a leaf token or the
@@ -76,7 +82,14 @@ func analyze(lang string, src []byte) *analysis {
 }
 
 func newAnalysis() *analysis {
-	return &analysis{imports: map[int]bool{}, sideEffect: map[int]string{}, errors: map[int]bool{}}
+	return &analysis{imports: map[int]bool{}, sideEffect: map[int]string{}, errors: map[int]bool{}, importOf: map[int]int{}}
+}
+
+func (a *analysis) addImport(first, last int, key string) {
+	for i := first; i <= last; i++ {
+		a.importOf[i] = len(a.importKeys)
+	}
+	a.importKeys = append(a.importKeys, key)
 }
 
 // atomic node kinds are compared as a whole instead of child by child, so no
@@ -124,6 +137,7 @@ func (a *analysis) walk(n *sitter.Node, src []byte) {
 		} else {
 			mark(a.imports, first, last)
 		}
+		a.addImport(first, last, importKey(n, src))
 	}
 	if atomic[kind] {
 		a.tokens = append(a.tokens, tok{atomicText(n, src), first, last})
@@ -157,6 +171,30 @@ func (a *analysis) walk(n *sitter.Node, src []byte) {
 	if n.IsNamed() {
 		a.tokens = append(a.tokens, tok{")", last, last})
 	}
+}
+
+// importKey is the text of an import statement without whitespace,
+// semicolons or commas, with its named bindings sorted.
+func importKey(n *sitter.Node, src []byte) string {
+	if atomic[n.Kind()] {
+		return atomicText(n, src)
+	}
+	if n.ChildCount() == 0 {
+		if t := n.Utf8Text(src); t != ";" && t != "," {
+			return t
+		}
+		return ""
+	}
+	var parts []string
+	for i := uint(0); i < n.ChildCount(); i++ {
+		if k := importKey(n.Child(i), src); k != "" {
+			parts = append(parts, k)
+		}
+	}
+	if n.Kind() == "named_imports" {
+		slices.Sort(parts)
+	}
+	return "(" + strings.Join(parts, " ") + ")"
 }
 
 func hasChild(n *sitter.Node, kind string) bool {
@@ -262,11 +300,16 @@ func analyzeGo(src []byte) *analysis {
 		for _, s := range g.Specs {
 			spec := s.(*ast.ImportSpec)
 			first, last := line(spec.Pos()), line(spec.End())
+			key := spec.Path.Value
+			if spec.Name != nil {
+				key = spec.Name.Name + " " + key
+			}
 			if spec.Name != nil && (spec.Name.Name == "_" || spec.Name.Name == ".") {
-				a.markSideEffect(first, last, spec.Name.Name+" "+spec.Path.Value)
+				a.markSideEffect(first, last, key)
 			} else {
 				mark(a.imports, first, last)
 			}
+			a.addImport(first, last, key)
 		}
 	}
 	return a

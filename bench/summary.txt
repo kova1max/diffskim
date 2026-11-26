@@ -1,7 +1,7 @@
 PRs: 30
-changed lines, all PRs: raw 14411, git diff -M -w + lockfile excludes 8772, diffskim 8094
-diffskim vs baseline, all PRs together: 7.7% fewer lines
-diffskim vs baseline, median PR: 1.1% fewer lines
+changed lines, all PRs: raw 14411, git diff -M -w + lockfile excludes 8772, diffskim 8437
+diffskim vs baseline, all PRs together: 3.8% fewer lines
+diffskim vs baseline, median PR: 0.0% fewer lines
 PRs where diffskim keeps at least 30% fewer lines than the baseline: 1 of 30
-PRs where diffskim keeps more lines than the baseline: 1 of 30
-folded lines by rule: lockfile 5045, generated 19, whitespace-only 250, import-only 255, format-only 748
+PRs where diffskim keeps more lines than the baseline: 7 of 30
+folded lines by rule: lockfile 5045, generated 19, whitespace-only 142, import-only 14, format-only 754

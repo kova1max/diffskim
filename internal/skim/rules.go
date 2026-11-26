@@ -93,25 +93,26 @@ func whitespaceSensitive(p string) bool {
 }
 
 // whitespaceOnly reports whether the removed and added lines are the same
-// lines once all whitespace is stripped from each, as git diff -w sees them.
+// lines once each has its leading and trailing whitespace trimmed and every
+// other run of whitespace collapsed to one space.
 func whitespaceOnly(removed, added []string) bool {
 	if len(removed) != len(added) {
 		return false
 	}
 	for i := range removed {
-		if stripSpace(removed[i]) != stripSpace(added[i]) {
+		if collapseSpace(removed[i]) != collapseSpace(added[i]) {
 			return false
 		}
 	}
 	return true
 }
 
-func stripSpace(s string) string {
-	return strings.Map(func(r rune) rune {
+func collapseSpace(s string) string {
+	return strings.Join(strings.FieldsFunc(s, func(r rune) bool {
 		switch r {
 		case ' ', '\t', '\r', '\v', '\f':
-			return -1
+			return true
 		}
-		return r
-	}, s)
+		return false
+	}), " ")
 }

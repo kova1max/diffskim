@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -38,25 +39,39 @@ func gitOutput(dir string, args ...string) ([]byte, error) {
 }
 
 // baselineArgs builds the git built-ins baseline that the summary compares
-// against: renames detected, whitespace ignored, lockfiles excluded.
-func baselineArgs(userArgs []string) []string {
-	revs, paths := userArgs, []string{"."}
+// against: renames detected, whitespace ignored, lockfiles excluded. Paths
+// the user gave without "--" are moved after it, where the excludes go.
+func baselineArgs(userArgs []string) ([]string, error) {
+	revs, paths := userArgs, []string(nil)
 	for i, a := range userArgs {
 		if a == "--" {
 			revs, paths = userArgs[:i], userArgs[i+1:]
-			if len(paths) == 0 {
-				paths = []string{"."}
-			}
 			break
 		}
 	}
+	out, err := gitOutput("", append([]string{"rev-parse", "--no-revs", "--no-flags"}, revs...)...)
+	if err != nil {
+		return nil, err
+	}
+	bare := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
+	var kept []string
+	for _, a := range revs {
+		if slices.Contains(bare, a) {
+			paths = append(paths, a)
+		} else {
+			kept = append(kept, a)
+		}
+	}
+	if len(paths) == 0 {
+		paths = []string{"."}
+	}
 	args := append(append([]string{}, gitDiffArgs...), "-M", "-w")
-	args = append(append(args, revs...), "--")
+	args = append(append(args, kept...), "--")
 	args = append(args, paths...)
 	for _, name := range lockfileExcludes() {
 		args = append(args, name)
 	}
-	return args
+	return args, nil
 }
 
 // repo answers questions about the git repository in the current directory.
