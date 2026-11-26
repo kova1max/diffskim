@@ -40,7 +40,8 @@ func gitOutput(dir string, args ...string) ([]byte, error) {
 
 // baselineArgs builds the git built-ins baseline that the summary compares
 // against: renames detected, whitespace ignored, lockfiles excluded. Paths
-// the user gave without "--" are moved after it, where the excludes go.
+// the user gave without "--" are moved after it, where the excludes go,
+// unless an option is given: its value could look like a path.
 func baselineArgs(userArgs []string) []string {
 	revs, paths := userArgs, []string(nil)
 	for i, a := range userArgs {
@@ -50,7 +51,8 @@ func baselineArgs(userArgs []string) []string {
 		}
 	}
 	var bare []string
-	if out, err := gitOutput("", append([]string{"rev-parse", "--no-revs", "--no-flags"}, revs...)...); err == nil {
+	hasOption := slices.ContainsFunc(revs, func(a string) bool { return strings.HasPrefix(a, "-") })
+	if out, err := gitOutput("", append([]string{"rev-parse", "--no-revs", "--no-flags"}, revs...)...); err == nil && !hasOption {
 		bare = strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
 	}
 	var kept []string

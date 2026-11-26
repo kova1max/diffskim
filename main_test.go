@@ -129,12 +129,27 @@ func TestGitModeWithSeparatedOptionValue(t *testing.T) {
 	if _, errOut, code := runCLI(t, "", "-G", "foo", "HEAD"); code != 0 || errOut != "diffskim: no changed lines\n" {
 		t.Errorf("-G foo: exit %d, summary %q", code, errOut)
 	}
-	out, errOut, code := runCLI(t, "", "-G", "role", "HEAD")
+	out, errOut, code := runCLI(t, "", "HEAD", "-G", "role")
 	if code != 0 {
 		t.Fatalf("-G role: exit %d: %s", code, errOut)
 	}
 	if !strings.Contains(out, "+  return user.role !== 'guest';") || !strings.Contains(errOut, "(git diff -M -w + lockfile excludes: ") {
 		t.Errorf("-G role: output %q, summary %q", out, errOut)
+	}
+}
+
+func TestOptionValueIsNotTakenForAPath(t *testing.T) {
+	dir := repoWithChanges(t)
+	if err := os.WriteFile(filepath.Join(dir, "role"), nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, errOut, code := runCLI(t, "", "HEAD", "-G", "role")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, errOut)
+	}
+	want := "diffskim: 8 changed lines -> 2 kept (git diff -M -w + lockfile excludes: 8); folded import-only 4, format-only 2\n"
+	if errOut != want {
+		t.Errorf("summary\n got %q\nwant %q", errOut, want)
 	}
 }
 
