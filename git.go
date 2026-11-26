@@ -51,9 +51,10 @@ func baselineArgs(userArgs []string) []string {
 		}
 	}
 	var bare []string
-	hasOption := slices.ContainsFunc(revs, func(a string) bool { return strings.HasPrefix(a, "-") })
-	if out, err := gitOutput("", append([]string{"rev-parse", "--no-revs", "--no-flags"}, revs...)...); err == nil && !hasOption {
-		bare = strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
+	if !slices.ContainsFunc(revs, func(a string) bool { return strings.HasPrefix(a, "-") }) {
+		if out, err := gitOutput("", append([]string{"rev-parse", "--no-revs", "--no-flags"}, revs...)...); err == nil {
+			bare = strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
+		}
 	}
 	var kept []string
 	for _, a := range revs {
