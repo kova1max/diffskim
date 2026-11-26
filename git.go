@@ -41,7 +41,7 @@ func gitOutput(dir string, args ...string) ([]byte, error) {
 // baselineArgs builds the git built-ins baseline that the summary compares
 // against: renames detected, whitespace ignored, lockfiles excluded. Paths
 // the user gave without "--" are moved after it, where the excludes go.
-func baselineArgs(userArgs []string) ([]string, error) {
+func baselineArgs(userArgs []string) []string {
 	revs, paths := userArgs, []string(nil)
 	for i, a := range userArgs {
 		if a == "--" {
@@ -49,11 +49,10 @@ func baselineArgs(userArgs []string) ([]string, error) {
 			break
 		}
 	}
-	out, err := gitOutput("", append([]string{"rev-parse", "--no-revs", "--no-flags"}, revs...)...)
-	if err != nil {
-		return nil, err
+	var bare []string
+	if out, err := gitOutput("", append([]string{"rev-parse", "--no-revs", "--no-flags"}, revs...)...); err == nil {
+		bare = strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
 	}
-	bare := strings.Split(strings.TrimSuffix(string(out), "\n"), "\n")
 	var kept []string
 	for _, a := range revs {
 		if slices.Contains(bare, a) {
@@ -71,7 +70,21 @@ func baselineArgs(userArgs []string) ([]string, error) {
 	for _, name := range lockfileExcludes() {
 		args = append(args, name)
 	}
-	return args, nil
+	return args
+}
+
+// baselineChanged counts the changed lines of the baseline, or returns -1
+// when git cannot produce it.
+func baselineChanged(userArgs []string) int {
+	out, err := gitOutput("", baselineArgs(userArgs)...)
+	if err != nil {
+		return -1
+	}
+	p, err := patch.Parse(string(out))
+	if err != nil {
+		return -1
+	}
+	return p.Changed()
 }
 
 // repo answers questions about the git repository in the current directory.

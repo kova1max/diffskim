@@ -137,19 +137,7 @@ func skimAndPrint(o options, stdin *os.File, stdout, stderr io.Writer) error {
 
 	baseline := -1
 	if useGit {
-		args, err := baselineArgs(o.gitArgs)
-		if err != nil {
-			return err
-		}
-		out, err := gitOutput("", args...)
-		if err != nil {
-			return err
-		}
-		bp, err := patch.Parse(string(out))
-		if err != nil {
-			return fmt.Errorf("cannot parse the baseline diff: %v", err)
-		}
-		baseline = bp.Changed()
+		baseline = baselineChanged(o.gitArgs)
 	}
 
 	switch {

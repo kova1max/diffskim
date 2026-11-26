@@ -124,6 +124,20 @@ func TestGitModeWithPathsWithoutDoubleDash(t *testing.T) {
 	}
 }
 
+func TestGitModeWithSeparatedOptionValue(t *testing.T) {
+	repoWithChanges(t)
+	if _, errOut, code := runCLI(t, "", "-G", "foo", "HEAD"); code != 0 || errOut != "diffskim: no changed lines\n" {
+		t.Errorf("-G foo: exit %d, summary %q", code, errOut)
+	}
+	out, errOut, code := runCLI(t, "", "-G", "role", "HEAD")
+	if code != 0 {
+		t.Fatalf("-G role: exit %d: %s", code, errOut)
+	}
+	if !strings.Contains(out, "+  return user.role !== 'guest';") || !strings.Contains(errOut, "(git diff -M -w + lockfile excludes: ") {
+		t.Errorf("-G role: output %q, summary %q", out, errOut)
+	}
+}
+
 func TestStdinModeMatchesGitMode(t *testing.T) {
 	repoWithChanges(t)
 	diff, err := exec.Command("git", "diff", "HEAD").Output()
