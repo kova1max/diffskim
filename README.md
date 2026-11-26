@@ -37,7 +37,7 @@ diffskim --json main...                # summary and folds as JSON
 ```
 
 - Arguments other than diffskim's own options go to `git diff`. With no arguments and nothing piped in, diffskim runs `git diff`.
-- The skimmed diff goes to stdout and a one-line summary goes to stderr (`-q` turns it off). When diffskim runs git itself, the summary also gives the git built-ins baseline: `git diff -M -w` with every lockfile excluded.
+- The skimmed diff goes to stdout and a one-line summary goes to stderr (`-q` turns it off). When diffskim runs git itself, the summary also gives the git built-ins baseline: `git diff -M -w` with every lockfile excluded. It is left out when git cannot produce it.
 - The output is still a patch. `git apply --check` accepts it against the old side, and applying it applies only the kept changes. Kept hunks keep their real line numbers.
 - Every hunk heading that follows folded changes says what was folded: `[folded above: import-only 2 lines]`. Whitespace-only lines folded out of a hunk that is otherwise kept are named in that hunk's heading as `[folded here: whitespace-only 12 lines]`. delta and plain `less` show these headings.
 - Exit status: 0 on success, 1 on an error (git failed, the input is not a unified diff), 2 on bad usage.
