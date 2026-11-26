@@ -1,6 +1,6 @@
 module github.com/kova1max/diffskim
 
-go 1.26.10
+go 1.24
 
 require (
 	github.com/tree-sitter/go-tree-sitter v0.25.0

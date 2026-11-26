@@ -15,7 +15,7 @@ import (
 // analysis is what the import and format rules need to know about one side
 // of a file. Line numbers are 1-based.
 type analysis struct {
-	imports    map[int]bool // lines of import statements
+	imports map[int]bool // lines of import statements
 	// sideEffect maps the lines of imports that only run code ("import './x'",
 	// Go "_" imports) to the imported path, on the statement's first line,
 	// or to "" on its other lines.
